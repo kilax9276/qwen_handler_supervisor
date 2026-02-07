@@ -533,6 +533,11 @@ Try:
 
 ### `PROFILE_BUSY` (HTTP 503)
 
+
+Copyright © kilax9276 (Kolobov Aleksei)
+
+Telegram: @kilax9276
+
 Another request is currently using the same profile. Use different `profile_id` or wait for the in-flight request to finish.
 
 #copyright "Kilax @kilax9276"

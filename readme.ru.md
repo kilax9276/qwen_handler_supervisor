@@ -531,6 +531,10 @@ pip install pyyaml
 
 ### `PROFILE_BUSY` (HTTP 503)
 
+Copyright © kilax9276 (Kolobov Aleksei)
+
+Telegram: @kilax9276
+
 Другой запрос уже использует тот же профиль. Используйте другой `profile_id` или дождитесь завершения текущего запроса.
 
 #copyright "Kilax @kilax9276"
