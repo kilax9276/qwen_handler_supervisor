@@ -368,21 +368,6 @@ Unlock:
 }
 ```
 
-### Admin endpoints
-
-> **Note:** The original upstream README mentions `/v1/admin/*`, but **this codebase does not expose any `/v1/admin/...` routes**.
-> In the current implementation, you can use:
->
-> - `GET /v1/status/all` to see enabled containers and their upstream status
-> - `config.yaml` to inspect configured containers/socks/profiles/prompts
-> - the SQLite database (`socks`, `profiles`, `chat_sessions`, `jobs`, `job_attempts`) for operational data
-
-If you need an admin API, you can implement a small router that returns:
-- containers from `config.yaml`
-- socks from `socks` table
-- profiles from `profiles` table
-- prompt registry entries from config
-
 ### Reports
 
 All report endpoints require `from` and `to` query params in ISO8601 (offset-naive timestamps are treated as UTC).
