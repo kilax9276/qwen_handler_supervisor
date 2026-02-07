@@ -1,0 +1,96 @@
+allow_socks_override: true
+
+containers:
+  - id: camoufox-1
+    base_url: http://127.0.0.1:8001
+    enabled: true
+    weight: 1
+    timeouts:
+      connect_seconds: 10
+      read_seconds: 120
+    analyze_retries: 1
+    
+  - id: camoufox-2
+    base_url: http://127.0.0.1:8002
+    enabled: true
+    weight: 1
+    timeouts:
+      connect_seconds: 10
+      read_seconds: 120
+    analyze_retries: 1
+
+  - id: camoufox-3
+    base_url: http://127.0.0.1:8003
+    enabled: true
+    weight: 1
+    timeouts:
+      connect_seconds: 10
+      read_seconds: 120
+    analyze_retries: 11
+
+  - id: camoufox-4
+    base_url: http://127.0.0.1:8004
+    enabled: true
+    weight: 1
+    timeouts:
+      connect_seconds: 10
+      read_seconds: 120
+    analyze_retries: 1
+    
+    
+socks:
+  - socks_id: s1
+    url: socks5://user:password@1.2.3.4:12580
+  - socks_id: s2
+    url: socks5://user:password@1.2.3.5:12580
+  - socks_id: s3
+    url: socks5://user:password@1.2.3.6:12580
+  - socks_id: s4
+    url: socks5://user:password@1.2.3.7:12580    
+    
+profiles:
+  - profile_id: p1
+    profile_value: /data/profiles/profile-001
+    socks_id: s1
+    allowed_containers: [camoufox-1, camoufox-2]
+    max_uses: 100
+    pending_replace: false
+  - profile_id: p2
+    profile_value: /data/profiles/profile-002
+    socks_id: s2
+    allowed_containers: [camoufox-1, camoufox-2]
+    max_uses: 100
+    pending_replace: false
+  - profile_id: p3
+    profile_value: /data/profiles/profile-003
+    socks_id: s3
+    allowed_containers: [camoufox-3]
+    max_uses: 100
+    pending_replace: false
+  - profile_id: p4
+    profile_value: /data/profiles/profile-004
+    socks_id: s4
+    allowed_containers: [camoufox-4]
+    max_uses: 100
+    pending_replace: false
+
+prompts:
+  - prompt_id: default
+    file: ./prompts/default.txt
+    default_max_chat_uses: 50
+  - prompt_id: promt1
+    file: ./prompts/prompt1.txt
+    default_max_chat_uses: 50
+  - prompt_id: promt2
+    file: ./prompts/prompt2.txt
+    default_max_chat_uses: 50
+
+container_io_log:
+  enabled: true
+  dir: ./logs/container-io
+  max_bytes: 10000000
+  backup_count: 5
+  include_bodies: true
+  redact_secrets: true
+  max_field_chars: 8000
+  level: INFO
