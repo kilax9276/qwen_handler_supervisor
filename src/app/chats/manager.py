@@ -1,3 +1,5 @@
+#copyright "Kilax @kilax9276"
+
 from __future__ import annotations
 
 import re

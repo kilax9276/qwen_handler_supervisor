@@ -1,3 +1,4 @@
+#copyright "Kilax @kilax9276"
 import sys
 from pathlib import Path
 

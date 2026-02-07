@@ -1,3 +1,4 @@
+#copyright "Kilax @kilax9276"
 import sqlite3
 from typing import Any, Optional
 

@@ -1,3 +1,4 @@
+#copyright "Kilax @kilax9276"
 from __future__ import annotations
 
 from datetime import datetime
