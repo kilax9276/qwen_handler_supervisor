@@ -23,6 +23,7 @@ from .schemas import (
 )
 from .settings import settings
 from .storage import get_default_storage
+from .status_service import build_status_all
 
 logger = logging.getLogger("orchestrator")
 
@@ -65,22 +66,29 @@ async def lifespan(app: FastAPI):
     cfg = load_config(settings.CONFIG_PATH)
     st = get_default_storage()
 
-    pool = UpstreamClientPool(cfg.containers)
+    # ВАЖНО: создаём io_logger и прокидываем в пул, чтобы UpstreamClient писал JSONL-логи
+    io_logger = ContainerIOLLogger.from_sources(yaml_config=cfg.container_io_log)
+
+    pool = UpstreamClientPool(cfg.containers, io_logger=io_logger)
     selector = ContainerSelector(pool=pool, storage=st)
     prompts = PromptRegistry(app_config=cfg, config_path=settings.CONFIG_PATH)
     profile_lock = ProfileLock()
     profiles = ProfileManager(storage=st, config=cfg)
     profiles.seed_from_config()
 
-    io_logger = ContainerIOLLogger.from_settings(
-        enabled=cfg.container_io_log.enabled,
-        log_dir=cfg.container_io_log.dir,
-        max_bytes=cfg.container_io_log.max_bytes,
-        backup_count=cfg.container_io_log.backup_count,
-        include_bodies=cfg.container_io_log.include_bodies,
-        redact_secrets=cfg.container_io_log.redact_secrets,
-        max_field_chars=cfg.container_io_log.max_field_chars,
-        level=cfg.container_io_log.level,
+    _json_log(
+        logging.INFO,
+        {
+            "event": "container_io_log_config",
+            "enabled": bool(getattr(cfg.container_io_log, "enabled", False)),
+            "dir": getattr(cfg.container_io_log, "dir", None),
+            "include_bodies": getattr(cfg.container_io_log, "include_bodies", None),
+            "redact_secrets": getattr(cfg.container_io_log, "redact_secrets", None),
+            "max_bytes": getattr(cfg.container_io_log, "max_bytes", None),
+            "backup_count": getattr(cfg.container_io_log, "backup_count", None),
+            "max_field_chars": getattr(cfg.container_io_log, "max_field_chars", None),
+            "level": getattr(cfg.container_io_log, "level", None),
+        },
     )
 
     executor = MultiContainerExecutor(
@@ -102,6 +110,7 @@ async def lifespan(app: FastAPI):
     app.state.prompts = prompts
     app.state.profile_lock = profile_lock
     app.state.executor = executor
+    app.state.io_logger = io_logger
 
     app.include_router(reports_router)
 
@@ -138,14 +147,8 @@ def create_app() -> FastAPI:
     async def v1_status_all() -> StatusResponse:
         st = get_default_storage()
         pool = app.state.pool
-        enabled = pool.list_enabled()
-        statuses: dict[str, Any] = {}
-        for cid in enabled:
-            try:
-                statuses[cid] = await pool.get(cid).status()
-            except Exception as e:
-                statuses[cid] = {"status": "error", "error": str(e)}
-        return StatusResponse(ok=True, status={"db": {"sqlite_path": st.sqlite_path}, "containers": statuses})
+        payload = await build_status_all(storage=st, pool=pool)
+        return StatusResponse(ok=True, status=payload)
 
     # --- chat lock (новые/старые пути) ---
 
@@ -176,12 +179,39 @@ def create_app() -> FastAPI:
     async def v1_chats_unlock(req: ChatUnlockRequest) -> dict[str, Any]:
         return await _do_unlock(req)
 
+    # --- guest/archive управление через API ---
+
+    @app.get("/v1/profiles/blocked")
+    async def v1_profiles_blocked() -> dict[str, Any]:
+        st = get_default_storage()
+        items = st.list_blocked_profiles()
+        return {"ok": True, "items": items, "meta": {"count": len(items)}}
+
+    @app.post("/v1/profiles/{profile_id}/guest/clear")
+    async def v1_profile_guest_clear(profile_id: str) -> dict[str, Any]:
+        st = get_default_storage()
+        deleted = st.delete_guest_chats_for_profile(profile_id)
+        return {"ok": True, "profile_id": profile_id, "deleted": int(deleted)}
+
+    @app.post("/v1/profiles/{profile_id}/chats/archive")
+    async def v1_profile_chats_archive(profile_id: str) -> dict[str, Any]:
+        st = get_default_storage()
+        archived = st.archive_chats_for_profile(profile_id)
+        return {"ok": True, "profile_id": profile_id, "archived": int(archived)}
+
     @app.post("/v1/solve")
     async def v1_solve(req: SolveRequest) -> JSONResponse:
         started_monotonic = time.monotonic()
         request_id = req.request_id or str(uuid.uuid4())
 
-        _json_log(logging.INFO, {"event": "solve_start", "request_id": request_id, "profile_id": (req.options.profile_id if req.options else None)})
+        _json_log(
+            logging.INFO,
+            {
+                "event": "solve_start",
+                "request_id": request_id,
+                "profile_id": (req.options.profile_id if req.options else None),
+            },
+        )
 
         executor = app.state.executor
 
@@ -215,7 +245,11 @@ def create_app() -> FastAPI:
                     "started_at": "",
                     "finished_at": "",
                 },
-                error={"code": "INTERNAL_ERROR", "message": "Внутренняя ошибка оркестратора.", "details": {"error": str(e)}},
+                error={
+                    "code": "INTERNAL_ERROR",
+                    "message": "Внутренняя ошибка оркестратора.",
+                    "details": {"error": str(e)},
+                },
             ).model_dump()
             return JSONResponse(status_code=500, content=payload)
 

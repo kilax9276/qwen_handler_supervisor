@@ -64,6 +64,7 @@ class FullChatSession:
     disabled: int
     locked_by: Optional[str]
     locked_until: Optional[str]
+    tag: Optional[str]
     created_at: str
     updated_at: str
 
@@ -76,6 +77,10 @@ class FullChatSession:
 _DB_INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 _DEFAULT_STORAGE: Optional["Storage"] = None
+
+
+_BLOCKED_CHAT_IDS = {"guest", "archive"}
+_BLOCKED_CHAT_TAGS = {"guest", "archive"}
 
 
 def _now_iso() -> str:
@@ -115,11 +120,37 @@ def _norm_key(v: Optional[str]) -> str:
     return v or ""
 
 
+def _norm_tag(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _is_blocked_chat(chat_id: Optional[str], tag: Optional[str]) -> bool:
+    cid = (chat_id or "").strip().lower()
+    t = (tag or "").strip().lower()
+    if cid in _BLOCKED_CHAT_IDS:
+        return True
+    if t in _BLOCKED_CHAT_TAGS:
+        return True
+    return False
+
+
 class Storage:
     """SQLite storage (full version only).
 
     MVP слой (chat_sessions_mvp и миграции в/из него) удалён намеренно.
     БД допускается пересоздавать с нуля.
+
+    Добавлены пометки чатов:
+      - chat_id == 'guest' (или tag == 'guest') => профиль блокируется для работы
+      - tag == 'archive' (или chat_id == 'archive') => чат нельзя переиспользовать
+
+    Важно:
+      - guest-блок профиля определяется наличием ХОТЯ БЫ ОДНОЙ записи в chat_sessions
+        с guest (даже если disabled=1).
+      - снятие guest-пометки реализовано удалением таких записей.
     """
 
     def __init__(self, sqlite_path: str) -> None:
@@ -179,6 +210,7 @@ class Storage:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_pending_replace ON profiles(pending_replace);")
 
                 # chat_sessions (FULL)
+                # ВАЖНО: добавили tag в CREATE TABLE для новых БД
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -191,6 +223,7 @@ class Storage:
                         page_url      TEXT NOT NULL,
                         uses_count    INTEGER NOT NULL DEFAULT 0,
                         disabled      INTEGER NOT NULL DEFAULT 0,
+                        tag           TEXT,
                         locked_by     TEXT,
                         locked_until  TEXT,
                         created_at    TEXT NOT NULL,
@@ -198,10 +231,34 @@ class Storage:
                     );
                     """
                 )
+
+                # forward-compat: если БД была создана раньше — добавим недостающие колонки ДО индексов по ним
+                cols = _table_columns(conn, "chat_sessions")
+                for col_name, col_sql in (
+                    ("disabled", "disabled INTEGER NOT NULL DEFAULT 0"),
+                    ("tag", "tag TEXT"),
+                    ("locked_by", "locked_by TEXT"),
+                    ("locked_until", "locked_until TEXT"),
+                ):
+                    if col_name not in cols:
+                        try:
+                            conn.execute(f"ALTER TABLE chat_sessions ADD COLUMN {col_sql};")
+                        except Exception:
+                            # если по какой-то причине ALTER TABLE не прошёл — не валим старт,
+                            # но индексы на отсутствующие колонки ниже всё равно не создадим
+                            pass
+
+                # индексы на chat_sessions — после миграций
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_chat_sess_lookup ON chat_sessions(container_id, prompt_id, profile_id, socks_id, disabled, id);"
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_page_url ON chat_sessions(page_url);")
+
+                # ВАЖНО: индекс по tag создаём только после гарантии, что колонка есть
+                # (на очень старых БД/битых миграциях может не появиться — тогда просто пропустим)
+                cols = _table_columns(conn, "chat_sessions")
+                if "tag" in cols:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_tag ON chat_sessions(tag);")
 
                 # jobs
                 conn.execute(
@@ -260,21 +317,10 @@ class Storage:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_job_id ON job_attempts(job_id);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_started_at ON job_attempts(started_at);")
 
-                # forward-compat: если БД когда-то была создана раньше — добавим недостающие колонки
-                cols = _table_columns(conn, "chat_sessions")
-                for col_name, col_sql in (
-                    ("locked_by", "locked_by TEXT"),
-                    ("locked_until", "locked_until TEXT"),
-                ):
-                    if col_name not in cols:
-                        try:
-                            conn.execute(f"ALTER TABLE chat_sessions ADD COLUMN {col_sql};")
-                        except Exception:
-                            pass
-
                 conn.commit()
 
             self._initialized = True
+
 
     # ------------------------------------------------------------------
     # Low-level helpers used by reports / executor
@@ -689,6 +735,12 @@ class Storage:
         socks_id: Optional[str],
         preferred_chat_id: Optional[str] = None,
     ) -> Optional[FullChatSession]:
+        """Возвращает последний активный (disabled=0) чат для пары (container,prompt,profile,socks).
+
+        Важно:
+          - чаты с chat_id='guest' или tag in ('guest','archive') не возвращаем,
+            чтобы ChatManager не переиспользовал такие записи.
+        """
         self.init()
         cid = str(container_id).strip()
         if not cid:
@@ -699,9 +751,13 @@ class Storage:
                 row = conn.execute(
                     """
                     SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                           uses_count, disabled, locked_by, locked_until, created_at, updated_at
+                           uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
                     FROM chat_sessions
-                    WHERE container_id=? AND prompt_id=? AND profile_id=? AND socks_id=? AND disabled=0 AND chat_id=?
+                    WHERE container_id=? AND prompt_id=? AND profile_id=? AND socks_id=?
+                      AND disabled=0
+                      AND COALESCE(chat_id,'') NOT IN ('guest','archive')
+                      AND COALESCE(tag,'') NOT IN ('guest','archive')
+                      AND chat_id=?
                     ORDER BY id DESC
                     LIMIT 1;
                     """,
@@ -711,9 +767,12 @@ class Storage:
                 row = conn.execute(
                     """
                     SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                           uses_count, disabled, locked_by, locked_until, created_at, updated_at
+                           uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
                     FROM chat_sessions
-                    WHERE container_id=? AND prompt_id=? AND profile_id=? AND socks_id=? AND disabled=0
+                    WHERE container_id=? AND prompt_id=? AND profile_id=? AND socks_id=?
+                      AND disabled=0
+                      AND COALESCE(chat_id,'') NOT IN ('guest','archive')
+                      AND COALESCE(tag,'') NOT IN ('guest','archive')
                     ORDER BY id DESC
                     LIMIT 1;
                     """,
@@ -735,6 +794,7 @@ class Storage:
             disabled=int(row["disabled"] or 0),
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
+            tag=row["tag"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -756,8 +816,8 @@ class Storage:
                 """
                 INSERT INTO chat_sessions (
                     container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                    uses_count, disabled, locked_by, locked_until, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?);
+                    uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, NULL, ?, ?);
                 """,
                 (str(container_id), prompt_id, _norm_key(profile_id), _norm_key(socks_id), chat_id, str(page_url), now, now),
             )
@@ -766,7 +826,7 @@ class Storage:
             row = conn.execute(
                 """
                 SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                       uses_count, disabled, locked_by, locked_until, created_at, updated_at
+                       uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
                 FROM chat_sessions
                 WHERE id=?;
                 """,
@@ -786,6 +846,7 @@ class Storage:
             disabled=int(row["disabled"] or 0),
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
+            tag=row["tag"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -797,6 +858,7 @@ class Storage:
         chat_id: Optional[str] = None,
         page_url: Optional[str] = None,
         disabled: Optional[bool] = None,
+        tag: Optional[str] = None,
     ) -> FullChatSession:
         self.init()
         now = _now_iso()
@@ -807,17 +869,25 @@ class Storage:
                 SET chat_id=COALESCE(?, chat_id),
                     page_url=COALESCE(?, page_url),
                     disabled=COALESCE(?, disabled),
+                    tag=COALESCE(?, tag),
                     updated_at=?
                 WHERE id=?;
                 """,
-                (chat_id, page_url, (1 if disabled else 0) if disabled is not None else None, now, int(chat_session_id)),
+                (
+                    chat_id,
+                    page_url,
+                    (1 if disabled else 0) if disabled is not None else None,
+                    _norm_tag(tag),
+                    now,
+                    int(chat_session_id),
+                ),
             )
             conn.commit()
 
             row = conn.execute(
                 """
                 SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                       uses_count, disabled, locked_by, locked_until, created_at, updated_at
+                       uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
                 FROM chat_sessions
                 WHERE id=?;
                 """,
@@ -837,6 +907,7 @@ class Storage:
             disabled=int(row["disabled"] or 0),
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
+            tag=row["tag"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -855,6 +926,14 @@ class Storage:
             conn.commit()
 
     def get_full_chat_session_by_url(self, page_url: str) -> Optional[FullChatSession]:
+        """Ищет чат по page_url.
+
+        Важно:
+          - возвращаем запись вне зависимости от disabled/tag/chat_id.
+            Это нужно, чтобы:
+              * корректно диагностировать, что pinned chat_url относится к guest/archive,
+              * а также для админских действий.
+        """
         self.init()
         url = (page_url or "").strip()
         if not url:
@@ -863,7 +942,7 @@ class Storage:
             row = conn.execute(
                 """
                 SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                       uses_count, disabled, locked_by, locked_until, created_at, updated_at
+                       uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
                 FROM chat_sessions
                 WHERE page_url=?
                 ORDER BY id DESC
@@ -887,9 +966,139 @@ class Storage:
             disabled=int(row["disabled"] or 0),
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
+            tag=row["tag"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    # ------------------------------------------------------------------
+    # Chat tags & profile blocks
+    # ------------------------------------------------------------------
+
+    def profile_has_guest_chat(self, profile_id: str) -> bool:
+        """True, если у профиля есть хотя бы один чат с guest (chat_id='guest' или tag='guest')."""
+        self.init()
+        pid = _norm_key(profile_id)
+        if not pid:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM chat_sessions
+                WHERE profile_id=? AND (chat_id='guest' OR tag='guest')
+                LIMIT 1;
+                """,
+                (pid,),
+            ).fetchone()
+        return bool(row)
+
+    def count_guest_chats_for_profile(self, profile_id: str) -> int:
+        self.init()
+        pid = _norm_key(profile_id)
+        if not pid:
+            return 0
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM chat_sessions
+                WHERE profile_id=? AND (chat_id='guest' OR tag='guest');
+                """,
+                (pid,),
+            ).fetchone()
+        if not row:
+            return 0
+        try:
+            return int(row["n"] or 0)
+        except Exception:
+            return 0
+
+    def list_blocked_profiles(self) -> list[dict[str, Any]]:
+        """Список профилей, которые заблокированы для использования из-за guest-чата."""
+        self.init()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT profile_id, COUNT(*) AS guest_chats
+                FROM chat_sessions
+                WHERE profile_id <> '' AND (chat_id='guest' OR tag='guest')
+                GROUP BY profile_id
+                ORDER BY profile_id ASC;
+                """
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "profile_id": str(r["profile_id"]),
+                    "reason": "guest",
+                    "guest_chats": int(r["guest_chats"] or 0),
+                }
+            )
+        return out
+
+    def delete_guest_chats_for_profile(self, profile_id: str) -> int:
+        """Удаляет все guest-записи чатов для профиля (chat_id='guest' или tag='guest')."""
+        self.init()
+        pid = _norm_key(profile_id)
+        if not pid:
+            return 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM chat_sessions WHERE profile_id=? AND (chat_id='guest' OR tag='guest');",
+                (pid,),
+            )
+            conn.commit()
+            try:
+                return int(cur.rowcount or 0)
+            except Exception:
+                return 0
+
+    def archive_chats_for_profile(self, profile_id: str) -> int:
+        """Помечает ВСЕ чаты профиля как archive и запрещает их дальнейшее использование."""
+        self.init()
+        pid = _norm_key(profile_id)
+        if not pid:
+            return 0
+        now = _now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE chat_sessions
+                SET tag='archive', disabled=1, updated_at=?
+                WHERE profile_id=?;
+                """,
+                (now, pid),
+            )
+            conn.commit()
+            try:
+                return int(cur.rowcount or 0)
+            except Exception:
+                return 0
+
+    def mark_chat_session_tag(self, chat_session_id: int, *, tag: str, disabled: Optional[bool] = None) -> None:
+        """Best-effort: проставить tag (и опционально disabled) для одной chat_session."""
+        self.init()
+        now = _now_iso()
+        with self._connect() as conn:
+            if disabled is None:
+                conn.execute(
+                    "UPDATE chat_sessions SET tag=?, updated_at=? WHERE id=?;",
+                    (_norm_tag(tag), now, int(chat_session_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE chat_sessions SET tag=?, disabled=?, updated_at=? WHERE id=?;",
+                    (_norm_tag(tag), 1 if disabled else 0, now, int(chat_session_id)),
+                )
+            conn.commit()
+
+    def is_chat_session_usable(self, chat_session: FullChatSession) -> bool:
+        if int(getattr(chat_session, "disabled", 0) or 0) != 0:
+            return False
+        return not _is_blocked_chat(getattr(chat_session, "chat_id", None), getattr(chat_session, "tag", None))
 
     # ------------------------------------------------------------------
     # Chat locks (full feature, оставлено)

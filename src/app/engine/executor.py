@@ -115,6 +115,25 @@ def _pick_text_from_raw(raw: Any) -> str:
         return str(raw)
 
 
+_BLOCKED_CHAT_IDS = {"guest", "archive"}
+
+
+def _is_blocked_chat(chat_id: Optional[str], tag: Optional[str]) -> bool:
+    """True если чат помечен как guest/archive (по chat_id или tag).
+
+    Используется как защита на уровне executor:
+      - pinned chat_url не должен указывать на guest/archive
+      - если upstream создал /c/guest, мы должны быстро исключить профиль
+    """
+    cid = (chat_id or "").strip().lower()
+    t = (tag or "").strip().lower()
+    if cid in _BLOCKED_CHAT_IDS:
+        return True
+    if t in _BLOCKED_CHAT_IDS:
+        return True
+    return False
+
+
 # =====================================================================
 # Multi-container executor (priority A)
 # =====================================================================
@@ -285,9 +304,11 @@ class MultiContainerExecutor:
             with self._storage._connect() as conn:
                 cur = conn.execute(
                     """
-                    SELECT id, container_id, profile_id, socks_id, chat_id, page_url, uses_count, disabled, locked_until, updated_at
+                    SELECT id, container_id, profile_id, socks_id, chat_id, page_url, uses_count, disabled, locked_until, tag, updated_at
                     FROM chat_sessions
                     WHERE prompt_id = ? AND disabled = 0
+                      AND COALESCE(chat_id,'') NOT IN ('guest','archive')
+                      AND COALESCE(tag,'') NOT IN ('guest','archive')
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,
@@ -331,6 +352,9 @@ class MultiContainerExecutor:
             if (cs.prompt_id or "") != (prompt_id or ""):
                 raise ValueError("chat_url не соответствует prompt_id")
 
+            if int(getattr(cs, "disabled", 0) or 0) != 0 or _is_blocked_chat(getattr(cs, "chat_id", None), getattr(cs, "tag", None)):
+                raise ValueError("chat_url относится к заблокированному чату (guest/archive) или disabled=1")
+
             if not profile_id:
                 profile_id = cs.profile_id
 
@@ -345,6 +369,8 @@ class MultiContainerExecutor:
                 "socks_id": cs.socks_id,
                 "chat_id": cs.chat_id,
                 "page_url": cs.page_url,
+                "tag": getattr(cs, "tag", None),
+                "disabled": int(getattr(cs, "disabled", 0) or 0),
             }
 
         # КЛЮЧЕВО ДЛЯ ТВОЕГО КЕЙСА:
@@ -602,6 +628,8 @@ class MultiContainerExecutor:
                 started_at=started_at,
             )
 
+        explicit_profile = bool(profile_id_opt or chat_url)
+
         profile_busy = 0
         container_busy = 0
 
@@ -650,6 +678,37 @@ class MultiContainerExecutor:
                 pr = self._storage.get_profile(resolved.profile_id)
                 if pr and int(pr.uses_count or 0) >= int(resolved.max_uses):
                     continue
+
+            # ===== 5.1.1) Guest-block: если у профиля есть ХОТЯ БЫ ОДНА запись chat_id='guest' (или tag='guest'),
+            # то профиль исключается из работы и НЕЛЬЗЯ создавать новые чаты.
+            if self._storage.profile_has_guest_chat(resolved.profile_id):
+                guest_n = 0
+                try:
+                    guest_n = int(self._storage.count_guest_chats_for_profile(resolved.profile_id) or 0)
+                except Exception:
+                    guest_n = 0
+
+                if explicit_profile:
+                    return self._fail(
+                        job_id=job_id,
+                        request_id=request_id,
+                        prompt_id=prompt_id,
+                        code="PROFILE_BLOCKED",
+                        message="Профиль заблокирован: обнаружены guest-чаты (chat_id='guest'). Новые чаты для этого профиля запрещены до очистки.",
+                        http_status=409,
+                        started_at=started_at,
+                        profile_id=resolved.profile_id,
+                        socks_id=socks_key,
+                        details={
+                            "reason": "guest_chat_present",
+                            "profile_id": resolved.profile_id,
+                            "guest_chats": guest_n,
+                            "hint": "Очистите guest-записи через POST /v1/profiles/{profile_id}/guest/clear",
+                        },
+                    )
+
+                # в авто-режиме просто пропускаем этот профиль
+                continue
 
             # ===== 5.2) Acquire profile lock =====
             try:
@@ -743,6 +802,77 @@ class MultiContainerExecutor:
                         )
                     except UpstreamBusyError:
                         container_busy += 1
+                        continue
+
+                    # chat_session_block_check: guest/archive
+                    # Если upstream создал /c/guest (или запись ранее была помечена),
+                    # то этот профиль должен быть исключён из работы и НЕЛЬЗЯ создавать новые чаты.
+                    if int(getattr(chat_session, 'disabled', 0) or 0) != 0 or _is_blocked_chat(getattr(chat_session, 'chat_id', None), getattr(chat_session, 'tag', None)):
+                        cid = (getattr(chat_session, 'chat_id', None) or '').strip().lower()
+                        tag = (getattr(chat_session, 'tag', None) or '').strip().lower()
+
+                        if cid == 'guest' or tag == 'guest':
+                            # Помечаем запись как guest (best-effort) и запрещаем её переиспользование.
+                            try:
+                                self._storage.mark_chat_session_tag(int(chat_session.id), tag='guest', disabled=True)
+                            except Exception:
+                                pass
+
+                            guest_n = 0
+                            try:
+                                guest_n = int(self._storage.count_guest_chats_for_profile(resolved.profile_id) or 0)
+                            except Exception:
+                                guest_n = 0
+
+                            return self._fail(
+                                job_id=job_id,
+                                request_id=request_id,
+                                prompt_id=prompt_id,
+                                code="PROFILE_BLOCKED",
+                                message="Профиль заблокирован: upstream вернул guest-чат (chat_id='guest').",
+                                http_status=409,
+                                started_at=started_at,
+                                profile_id=resolved.profile_id,
+                                socks_id=socks_key,
+                                container_ids_used=[container_id],
+                                details={
+                                    "reason": "guest_chat_created",
+                                    "profile_id": resolved.profile_id,
+                                    "guest_chats": guest_n,
+                                    "chat_session_id": str(chat_session.id),
+                                    "page_url": chat_session.page_url,
+                                    "hint": "Очистите guest-записи через POST /v1/profiles/{profile_id}/guest/clear",
+                                },
+                            )
+
+                        # archive (или иной blocked) — конкретный чат использовать нельзя
+                        try:
+                            self._storage.mark_chat_session_tag(int(chat_session.id), tag='archive', disabled=True)
+                        except Exception:
+                            pass
+
+                        if explicit_profile:
+                            return self._fail(
+                                job_id=job_id,
+                                request_id=request_id,
+                                prompt_id=prompt_id,
+                                code="CHAT_BLOCKED",
+                                message="Чат помечен как guest/archive и не может быть использован.",
+                                http_status=409,
+                                started_at=started_at,
+                                profile_id=resolved.profile_id,
+                                socks_id=socks_key,
+                                container_ids_used=[container_id],
+                                details={
+                                    "reason": "chat_blocked",
+                                    "chat_session_id": str(chat_session.id),
+                                    "chat_id": getattr(chat_session, 'chat_id', None),
+                                    "tag": getattr(chat_session, 'tag', None),
+                                    "page_url": chat_session.page_url,
+                                },
+                            )
+
+                        # авто-режим — пробуем другого кандидата
                         continue
 
                     # ===== 5.8) Create attempt row =====

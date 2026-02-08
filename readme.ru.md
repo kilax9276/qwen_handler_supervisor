@@ -7,6 +7,8 @@ QwenHandlerSupervisor — это **оркестратор на базе FastAPI*
 - **Управление SOCKS‑прокси** (через `socks_id` или прямой URL‑override)
 - **Реестр промптов** на файловой основе (стартовый промпт отправляется один раз при создании нового чата)
 - **SQLite‑бэкенд для состояния и наблюдаемости** (jobs, attempts, chat sessions, usage reports)
+- **Защита guest/archive**: профили с `chat_id='guest'`/`tag='guest'` блокируются; архивные чаты (`tag='archive'`/`disabled=1`) не переиспользуются; есть API для очистки/архивации.
+
 - Опциональное **поконтейнерное I/O‑логирование** (JSONL, с редактированием секретов)
 
 > В этом репозитории поставляется *полный multi-container режим*. Для запуска обязателен `CONFIG_PATH`.
@@ -266,7 +268,7 @@ Base URL: `http://<host>:9000`
 
 Если `container_id` не указан — возвращается статус первого enabled контейнера.
 
-`GET /v1/status/all` возвращает статусы всех enabled контейнеров + путь к БД.
+`GET /v1/status/all` возвращает статусы всех enabled контейнеров + путь к БД + блокировки профилей (guest) и привязку контейнеров к chat sessions (`orchestrator_chat_session`, `orchestrator_flags`).
 
 ### Solve
 
@@ -334,6 +336,7 @@ Base URL: `http://<host>:9000`
 
 Типовые коды ошибок:
 - `INVALID_REQUEST` (HTTP 400)
+- `PROFILE_BLOCKED` (HTTP 409) — профиль заблокирован из‑за guest‑чата (`chat_id='guest'`/`tag='guest'`)
 - `PROFILE_BUSY` (HTTP 503) — профиль занят (заблокирован другим in-flight запросом)
 - `CONTAINER_BUSY` (HTTP 503) — нет доступных контейнеров / upstream вернул busy (HTTP 423)
 - `UPSTREAM_ERROR` (HTTP 502) — upstream 5xx или transport ошибки после ретраев
@@ -365,6 +368,26 @@ Unlock:
   "locked_by": "operator"
 }
 ```
+
+
+
+### Guest / Archive (блокировки и обслуживание чатов профиля)
+
+Оркестратор использует пометки в `chat_sessions` для защиты от “неправильных” чатов:
+
+- **guest**: если у профиля найден хотя бы один чат с `chat_id='guest'` (или `tag='guest'`), профиль считается **заблокированным**. Оркестратор:
+  - не использует такие чаты для задач;
+  - **не создаёт** новые чаты на этом профиле;
+  - при явном `options.profile_id` вернёт `PROFILE_BLOCKED` (HTTP 409).
+- **archive**: при установке `tag='archive'` и/или `disabled=1` чат считается архивным и **никогда не переиспользуется**.
+
+Эндпоинты обслуживания:
+
+- `GET /v1/profiles/blocked` — список профилей, заблокированных из‑за guest.
+- `POST /v1/profiles/{profile_id}/guest/clear` — удалить все guest‑записи чатов профиля (снимает блокировку).
+- `POST /v1/profiles/{profile_id}/chats/archive` — пометить все чаты профиля как `archive` (не будут использоваться).
+
+Подсказка: `/v1/status/all` в поле `blocked.profiles` показывает, какие профили сейчас заблокированы, а в `containers.*.orchestrator_flags` — пригодность текущего чата контейнера.
 
 
 ### Отчёты (Reports)
@@ -454,9 +477,15 @@ SQLite инициализируется автоматически при ста
 
 - `socks(socks_id, url, created_at, updated_at)`
 - `profiles(profile_id, profile_value, socks_id, allowed_containers_json, uses_count, max_uses, pending_replace, ...)`
-- `chat_sessions(id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url, uses_count, disabled, locked_by, locked_until, ...)`
+- `chat_sessions(id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url, uses_count, disabled, tag, locked_by, locked_until, ...)`
 - `jobs(job_id, request_id, prompt_id, selected_prompt_id, decision_mode, ..., status, result_text, error_code, ...)`
 - `job_attempts(attempt_id, job_id, container_id, prompt_id, role, ..., status, result_text, error_code, ...)`
+
+
+**Семантика пометок чатов:**
+
+- `chat_id='guest'` или `tag='guest'` → профиль считается **заблокированным** и исключается из работы до очистки (`POST /v1/profiles/{profile_id}/guest/clear`).
+- `tag='archive'` и/или `disabled=1` → чат считается **архивным** и не переиспользуется оркестратором.
 
 ---
 
@@ -487,10 +516,32 @@ logs/container-io/camoufox-2.jsonl
 - **`allowed_containers` строго применяется.** Профиль может работать только на контейнерах, перечисленных в `allowed_containers`.
 - **Относительные пути** в конфиге (файлы промптов, директория IO логов) резолвятся относительно директории, содержащей `config.yaml`.
 - **`include_debug`** рассчитан на дев‑режим. Если вы используете это поле, проверьте формат вывода на вашей версии схем.
+- **Guest-профили исключаются из работы.** Если у профиля есть guest‑чат, оркестратор не создаёт новые чаты и возвращает `PROFILE_BLOCKED` при явном выборе профиля. Очистка: `POST /v1/profiles/{profile_id}/guest/clear`.
+- **Archive-чаты не переиспользуются.** Массовая архивация: `POST /v1/profiles/{profile_id}/chats/archive`.
 
 ---
 
 ## Troubleshooting
+
+### `PROFILE_BLOCKED` (HTTP 409)
+
+Профиль заблокирован: в `chat_sessions` найдены guest‑записи (`chat_id='guest'` и/или `tag='guest'`). Пока хотя бы одна guest‑запись существует, оркестратор **не будет** использовать профиль и **не будет** создавать новые чаты на нём.
+
+Проверка:
+
+```bash
+curl -s http://127.0.0.1:9000/v1/profiles/blocked
+curl -s http://127.0.0.1:9000/v1/status/all
+```
+
+Очистка:
+
+```bash
+curl -s -X POST http://127.0.0.1:9000/v1/profiles/<profile_id>/guest/clear
+```
+
+Важно: если вы явно передаёте `options.profile_id`, оркестратор не “переключится” на другой профиль автоматически — он вернёт ошибку для указанного профиля.
+
 
 ### `RuntimeError: CONFIG_PATH is required`
 

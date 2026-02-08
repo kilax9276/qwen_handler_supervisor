@@ -7,6 +7,8 @@ QwenHandlerSupervisor is a **FastAPI-based orchestrator** that routes `/v1/solve
 - **SOCKS proxy management** (by `socks_id` or direct URL override)
 - **Prompt registry** backed by files (start prompt sent once when a new chat is created)
 - **SQLite-backed state and observability** (jobs, attempts, chat sessions, usage reports)
+- **guest/archive protection**: profiles with `chat_id='guest'`/`tag='guest'` are blocked; archived chats (`tag='archive'`/`disabled=1`) are never reused; maintenance APIs are provided.
+
 - Optional **per-container I/O logging** (JSONL, with secret redaction)
 
 > This repository ships the *full multi-container* mode. `CONFIG_PATH` is required to start the app.
@@ -268,7 +270,7 @@ Response:
 
 If `container_id` is omitted, returns status of the first enabled container.
 
-`GET /v1/status/all` returns status for all enabled containers + DB path.
+`GET /v1/status/all` returns status for all enabled containers + DB path + guest blocked profiles and per-container chat-session enrichment (`orchestrator_chat_session`, `orchestrator_flags`).
 
 ### Solve
 
@@ -336,6 +338,7 @@ Error:
 
 Common error codes:
 - `INVALID_REQUEST` (HTTP 400)
+- `PROFILE_BLOCKED` (HTTP 409) — profile is blocked due to guest chat (`chat_id='guest'`/`tag='guest'`)
 - `PROFILE_BUSY` (HTTP 503) — profile is locked by another in-flight request
 - `CONTAINER_BUSY` (HTTP 503) — no available containers / upstream returned busy (HTTP 423)
 - `UPSTREAM_ERROR` (HTTP 502) — upstream 5xx or transport failures after retries
@@ -367,6 +370,26 @@ Unlock:
   "locked_by": "operator"
 }
 ```
+
+
+### Guest / Archive (profile blocking & chat maintenance)
+
+The orchestrator uses chat markers stored in `chat_sessions` to protect against “bad” chats:
+
+- **guest**: if a profile has at least one chat with `chat_id='guest'` (or `tag='guest'`), the profile is treated as **blocked**. The orchestrator:
+  - will not send tasks to such chats;
+  - will **not create** new chats for that profile;
+  - returns `PROFILE_BLOCKED` (HTTP 409) when the client explicitly pins `options.profile_id`.
+- **archive**: when `tag='archive'` and/or `disabled=1` is set, the chat is treated as archived and is **never reused**.
+
+Maintenance endpoints:
+
+- `GET /v1/profiles/blocked` — list profiles blocked due to guest.
+- `POST /v1/profiles/{profile_id}/guest/clear` — delete guest chat records for a profile (removes the block).
+- `POST /v1/profiles/{profile_id}/chats/archive` — mark all chats of a profile as `archive` (they won't be reused).
+
+Tip: `/v1/status/all` shows blocked profiles under `blocked.profiles`, and per-container suitability in `containers.*.orchestrator_flags`.
+
 
 ### Reports
 
@@ -455,9 +478,15 @@ Main tables:
 
 - `socks(socks_id, url, created_at, updated_at)`
 - `profiles(profile_id, profile_value, socks_id, allowed_containers_json, uses_count, max_uses, pending_replace, ...)`
-- `chat_sessions(id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url, uses_count, disabled, locked_by, locked_until, ...)`
+- `chat_sessions(id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url, uses_count, disabled, tag, locked_by, locked_until, ...)`
 - `jobs(job_id, request_id, prompt_id, selected_prompt_id, decision_mode, ..., status, result_text, error_code, ...)`
 - `job_attempts(attempt_id, job_id, container_id, prompt_id, role, ..., status, result_text, error_code, ...)`
+
+
+**Chat markers semantics:**
+
+- `chat_id='guest'` or `tag='guest'` → the profile is **blocked** until cleared (`POST /v1/profiles/{profile_id}/guest/clear`).
+- `tag='archive'` and/or `disabled=1` → the chat is **archived** and is not reused by the orchestrator.
 
 ---
 
@@ -492,6 +521,26 @@ Each line includes timestamps, request/response, status codes, duration, and bes
 ---
 
 ## Troubleshooting
+
+### `PROFILE_BLOCKED` (HTTP 409)
+
+The profile is blocked because `chat_sessions` contains guest records (`chat_id='guest'` and/or `tag='guest'`). While at least one guest record exists, the orchestrator will **not** use that profile and will **not** create new chats for it.
+
+Check:
+
+```bash
+curl -s http://127.0.0.1:9000/v1/profiles/blocked
+curl -s http://127.0.0.1:9000/v1/status/all
+```
+
+Clear:
+
+```bash
+curl -s -X POST http://127.0.0.1:9000/v1/profiles/<profile_id>/guest/clear
+```
+
+Important: if you explicitly pass `options.profile_id`, the orchestrator will not “switch” to another profile automatically — it will return an error for the selected profile.
+
 
 ### `RuntimeError: CONFIG_PATH is required`
 
