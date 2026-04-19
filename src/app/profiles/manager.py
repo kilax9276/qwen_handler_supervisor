@@ -1,11 +1,12 @@
 #copyright "Kilax @kilax9276"
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 from ..config_loader import AppConfig
-from ..storage import ProfileRow, SocksRow, Storage
+from ..storage import ProfileRow, Storage
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class ResolvedProfile:
     allowed_containers: list[str]
     max_uses: Optional[int]
     pending_replace: bool
+    manual_only: bool
 
 
 class ProfileManager:
@@ -24,13 +26,18 @@ class ProfileManager:
         self._storage = storage
         self._config = config
 
-    def seed_from_config(self) -> None:
-        """Upserts socks+profiles from YAML into SQLite.
+    def seed_from_config(self, *, prune_missing: bool = True) -> dict[str, int]:
+        """Sync socks+profiles from YAML into SQLite.
 
-        This is idempotent and safe to call on start.
+        manual_only intentionally stays in YAML only and does not require DB schema changes.
+        By default SQLite mirrors the current YAML so runtime reload reflects file edits fully.
         """
+        current_socks: list[str] = []
+        current_profiles: list[str] = []
+
         for s in self._config.socks:
             self._storage.upsert_socks(s.socks_id, s.url)
+            current_socks.append(s.socks_id)
 
         for p in self._config.profiles:
             self._storage.upsert_profile(
@@ -42,9 +49,32 @@ class ProfileManager:
                 pending_replace=bool(p.pending_replace),
                 preserve_existing_socks=False,
             )
+            current_profiles.append(p.profile_id)
+
+        deleted_profiles = 0
+        deleted_socks = 0
+        if prune_missing:
+            deleted_profiles = int(self._storage.delete_profiles_except(current_profiles) or 0)
+            deleted_socks = int(self._storage.delete_socks_except(current_socks) or 0)
+
+        return {
+            "profiles_upserted": len(current_profiles),
+            "socks_upserted": len(current_socks),
+            "profiles_deleted": deleted_profiles,
+            "socks_deleted": deleted_socks,
+        }
 
     def get_profile(self, profile_id: str) -> Optional[ProfileRow]:
         return self._storage.get_profile(profile_id)
+
+    def is_manual_only(self, profile_id: str) -> bool:
+        pid = (profile_id or "").strip()
+        if not pid:
+            return False
+        for p in self._config.profiles:
+            if (p.profile_id or "").strip() == pid:
+                return bool(getattr(p, "manual_only", False))
+        return False
 
     def resolve_for_request(
         self,
@@ -74,7 +104,6 @@ class ProfileManager:
                 raise KeyError(f"Unknown socks_id: {socks_id_used}")
             socks_url_used = row.url
 
-        # совместимость: allowed_containers или allowed_containers_json
         if hasattr(prof, "allowed_containers"):
             allowed = list(getattr(prof, "allowed_containers") or [])
         else:
@@ -92,8 +121,8 @@ class ProfileManager:
             allowed_containers=allowed,
             max_uses=getattr(prof, "max_uses", None),
             pending_replace=bool(getattr(prof, "pending_replace", False)),
+            manual_only=self.is_manual_only(prof.profile_id),
         )
-
 
     def increment_use(self, profile_id: str) -> None:
         self._storage.increment_profile_use(profile_id)

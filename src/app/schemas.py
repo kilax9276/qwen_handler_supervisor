@@ -14,7 +14,7 @@ class SolveInput(BaseModel):
 
 
 class SolveOptions(BaseModel):
-    prompt_id: str = "default"
+    prompt_id: Optional[str] = "default"
     profile_id: Optional[str] = None
     socks_override: Optional[str] = None
     socks_id: Optional[str] = None  # legacy alias
@@ -71,3 +71,17 @@ class ChatLockRequest(BaseModel):
 class ChatUnlockRequest(BaseModel):
     chat_url: str
     locked_by: str
+
+
+class ChatRestRequest(BaseModel):
+    chat_url: str
+    ttl_seconds: Optional[int] = None
+
+
+class ChatMarkerClearRequest(BaseModel):
+    chat_url: str
+
+
+class ChatLoggedOutRequest(BaseModel):
+    chat_url: str
+    logged_out: bool = True

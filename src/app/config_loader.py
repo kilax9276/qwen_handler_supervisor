@@ -34,11 +34,31 @@ class ProfileConfig(BaseModel):
     allowed_containers: list[str] = Field(default_factory=list)
     max_uses: Optional[int] = None
     pending_replace: bool = False
+    manual_only: bool = False
 
 
 class PromptConfig(BaseModel):
     prompt_id: str
     file: str
+    default_max_chat_uses: int = 50
+
+
+class ChatPolicyConfig(BaseModel):
+    """Global chat routing defaults.
+
+    promptless_idle_seconds:
+      Minimum idle time for a promptless/direct chat before it may be auto-assigned
+      on a new request without prompt_id/chat_url.
+
+    default_rest_ttl_seconds:
+      Default duration for the manual 'rest' marker.
+
+    default_max_chat_uses:
+      Fallback chat usage limit when a request runs without a base prompt.
+    """
+
+    promptless_idle_seconds: int = 900
+    default_rest_ttl_seconds: int = 900
     default_max_chat_uses: int = 50
 
 
@@ -60,6 +80,7 @@ class AppConfig(BaseModel):
     socks: list[SocksConfig] = Field(default_factory=list)
     profiles: list[ProfileConfig] = Field(default_factory=list)
     prompts: list[PromptConfig] = Field(default_factory=list)
+    chat_policy: ChatPolicyConfig = Field(default_factory=ChatPolicyConfig)
 
     # Whether /v1/solve may override socks via options.socks_override.
     allow_socks_override: bool = True
@@ -75,7 +96,6 @@ def _resolve_relative_path(base_dir: Path, value: str) -> str:
     p = Path(v)
     if p.is_absolute():
         return str(p)
-    # Resolve relative paths against the directory of CONFIG_PATH YAML.
     return str((base_dir / p).resolve())
 
 
@@ -100,13 +120,11 @@ def load_config(path: str) -> AppConfig:
     if not isinstance(data, dict):
         raise ValueError("config YAML root must be a mapping")
 
-    # Support nested key "config" if user wraps it.
     if "config" in data and isinstance(data["config"], dict):
         data = data["config"]
 
     cfg = AppConfig.model_validate(data)
 
-    # Make paths predictable: resolve relative paths against config directory.
     base_dir = p.resolve().parent
     try:
         cfg.container_io_log.dir = _resolve_relative_path(base_dir, cfg.container_io_log.dir)

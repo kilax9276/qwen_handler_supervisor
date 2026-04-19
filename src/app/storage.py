@@ -62,6 +62,8 @@ class FullChatSession:
     page_url: str
     uses_count: int
     disabled: int
+    logged_out: int
+    rest_until: Optional[str]
     locked_by: Optional[str]
     locked_until: Optional[str]
     tag: Optional[str]
@@ -135,6 +137,16 @@ def _is_blocked_chat(chat_id: Optional[str], tag: Optional[str]) -> bool:
     if t in _BLOCKED_CHAT_TAGS:
         return True
     return False
+
+
+def _is_logged_out_or_resting(*, logged_out: Optional[int], rest_until: Optional[str], now: Optional[datetime] = None) -> bool:
+    if int(logged_out or 0) != 0:
+        return True
+    until = _parse_iso(rest_until)
+    if until is None:
+        return False
+    now_dt = now or datetime.now(timezone.utc)
+    return until > now_dt
 
 
 class Storage:
@@ -223,6 +235,8 @@ class Storage:
                         page_url      TEXT NOT NULL,
                         uses_count    INTEGER NOT NULL DEFAULT 0,
                         disabled      INTEGER NOT NULL DEFAULT 0,
+                        logged_out    INTEGER NOT NULL DEFAULT 0,
+                        rest_until    TEXT,
                         tag           TEXT,
                         locked_by     TEXT,
                         locked_until  TEXT,
@@ -236,6 +250,8 @@ class Storage:
                 cols = _table_columns(conn, "chat_sessions")
                 for col_name, col_sql in (
                     ("disabled", "disabled INTEGER NOT NULL DEFAULT 0"),
+                    ("logged_out", "logged_out INTEGER NOT NULL DEFAULT 0"),
+                    ("rest_until", "rest_until TEXT"),
                     ("tag", "tag TEXT"),
                     ("locked_by", "locked_by TEXT"),
                     ("locked_until", "locked_until TEXT"),
@@ -259,6 +275,10 @@ class Storage:
                 cols = _table_columns(conn, "chat_sessions")
                 if "tag" in cols:
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_tag ON chat_sessions(tag);")
+                if "logged_out" in cols:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_logged_out ON chat_sessions(logged_out);")
+                if "rest_until" in cols:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_rest_until ON chat_sessions(rest_until);")
 
                 # jobs
                 conn.execute(
@@ -358,6 +378,18 @@ class Storage:
         if not row:
             return None
         return SocksRow(socks_id=row["socks_id"], url=row["url"], created_at=row["created_at"], updated_at=row["updated_at"])
+
+    def delete_socks_except(self, socks_ids: Sequence[str]) -> int:
+        self.init()
+        keep = [str(x).strip() for x in (socks_ids or []) if str(x).strip()]
+        with self._connect() as conn:
+            if keep:
+                placeholders = ",".join(["?"] * len(keep))
+                cur = conn.execute(f"DELETE FROM socks WHERE socks_id NOT IN ({placeholders});", tuple(keep))
+            else:
+                cur = conn.execute("DELETE FROM socks;")
+            conn.commit()
+            return int(getattr(cur, "rowcount", 0) or 0)
 
     # ------------------------------------------------------------------
     # Profiles
@@ -486,6 +518,18 @@ class Storage:
             )
         return out
 
+
+    def delete_profiles_except(self, profile_ids: Sequence[str]) -> int:
+        self.init()
+        keep = [str(x).strip() for x in (profile_ids or []) if str(x).strip()]
+        with self._connect() as conn:
+            if keep:
+                placeholders = ",".join(["?"] * len(keep))
+                cur = conn.execute(f"DELETE FROM profiles WHERE profile_id NOT IN ({placeholders});", tuple(keep))
+            else:
+                cur = conn.execute("DELETE FROM profiles;")
+            conn.commit()
+            return int(getattr(cur, "rowcount", 0) or 0)
 
     def increment_profile_use(self, profile_id: str, *, by: int = 1) -> None:
         self.init()
@@ -751,32 +795,36 @@ class Storage:
                 row = conn.execute(
                     """
                     SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                           uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
+                           uses_count, disabled, logged_out, rest_until, locked_by, locked_until, tag, created_at, updated_at
                     FROM chat_sessions
                     WHERE container_id=? AND prompt_id=? AND profile_id=? AND socks_id=?
                       AND disabled=0
+                      AND COALESCE(logged_out,0)=0
+                      AND (rest_until IS NULL OR rest_until <= ?)
                       AND COALESCE(chat_id,'') NOT IN ('guest','archive')
                       AND COALESCE(tag,'') NOT IN ('guest','archive')
                       AND chat_id=?
                     ORDER BY id DESC
                     LIMIT 1;
                     """,
-                    (cid, prompt_id, _norm_key(profile_id), _norm_key(socks_id), preferred_chat_id),
+                    (cid, prompt_id, _norm_key(profile_id), _norm_key(socks_id), _now_iso(), preferred_chat_id),
                 ).fetchone()
             else:
                 row = conn.execute(
                     """
                     SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                           uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
+                           uses_count, disabled, logged_out, rest_until, locked_by, locked_until, tag, created_at, updated_at
                     FROM chat_sessions
                     WHERE container_id=? AND prompt_id=? AND profile_id=? AND socks_id=?
                       AND disabled=0
+                      AND COALESCE(logged_out,0)=0
+                      AND (rest_until IS NULL OR rest_until <= ?)
                       AND COALESCE(chat_id,'') NOT IN ('guest','archive')
                       AND COALESCE(tag,'') NOT IN ('guest','archive')
                     ORDER BY id DESC
                     LIMIT 1;
                     """,
-                    (cid, prompt_id, _norm_key(profile_id), _norm_key(socks_id)),
+                    (cid, prompt_id, _norm_key(profile_id), _norm_key(socks_id), _now_iso()),
                 ).fetchone()
 
         if not row:
@@ -792,6 +840,8 @@ class Storage:
             page_url=row["page_url"],
             uses_count=int(row["uses_count"] or 0),
             disabled=int(row["disabled"] or 0),
+            logged_out=int(row["logged_out"] or 0),
+            rest_until=row["rest_until"],
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
             tag=row["tag"],
@@ -816,8 +866,8 @@ class Storage:
                 """
                 INSERT INTO chat_sessions (
                     container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                    uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, NULL, ?, ?);
+                    uses_count, disabled, logged_out, rest_until, locked_by, locked_until, tag, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?);
                 """,
                 (str(container_id), prompt_id, _norm_key(profile_id), _norm_key(socks_id), chat_id, str(page_url), now, now),
             )
@@ -826,7 +876,7 @@ class Storage:
             row = conn.execute(
                 """
                 SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                       uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
+                       uses_count, disabled, logged_out, rest_until, locked_by, locked_until, tag, created_at, updated_at
                 FROM chat_sessions
                 WHERE id=?;
                 """,
@@ -844,6 +894,8 @@ class Storage:
             page_url=row["page_url"],
             uses_count=int(row["uses_count"] or 0),
             disabled=int(row["disabled"] or 0),
+            logged_out=int(row["logged_out"] or 0),
+            rest_until=row["rest_until"],
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
             tag=row["tag"],
@@ -859,9 +911,13 @@ class Storage:
         page_url: Optional[str] = None,
         disabled: Optional[bool] = None,
         tag: Optional[str] = None,
+        logged_out: Optional[bool] = None,
+        rest_until: Optional[str] = None,
+        clear_rest: bool = False,
     ) -> FullChatSession:
         self.init()
         now = _now_iso()
+        rest_value = None if clear_rest else rest_until
         with self._connect() as conn:
             conn.execute(
                 """
@@ -870,6 +926,8 @@ class Storage:
                     page_url=COALESCE(?, page_url),
                     disabled=COALESCE(?, disabled),
                     tag=COALESCE(?, tag),
+                    logged_out=COALESCE(?, logged_out),
+                    rest_until=CASE WHEN ? THEN NULL ELSE COALESCE(?, rest_until) END,
                     updated_at=?
                 WHERE id=?;
                 """,
@@ -878,6 +936,9 @@ class Storage:
                     page_url,
                     (1 if disabled else 0) if disabled is not None else None,
                     _norm_tag(tag),
+                    (1 if logged_out else 0) if logged_out is not None else None,
+                    1 if clear_rest else 0,
+                    rest_value,
                     now,
                     int(chat_session_id),
                 ),
@@ -887,7 +948,7 @@ class Storage:
             row = conn.execute(
                 """
                 SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                       uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
+                       uses_count, disabled, logged_out, rest_until, locked_by, locked_until, tag, created_at, updated_at
                 FROM chat_sessions
                 WHERE id=?;
                 """,
@@ -905,6 +966,8 @@ class Storage:
             page_url=row["page_url"],
             uses_count=int(row["uses_count"] or 0),
             disabled=int(row["disabled"] or 0),
+            logged_out=int(row["logged_out"] or 0),
+            rest_until=row["rest_until"],
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
             tag=row["tag"],
@@ -942,7 +1005,7 @@ class Storage:
             row = conn.execute(
                 """
                 SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
-                       uses_count, disabled, locked_by, locked_until, tag, created_at, updated_at
+                       uses_count, disabled, logged_out, rest_until, locked_by, locked_until, tag, created_at, updated_at
                 FROM chat_sessions
                 WHERE page_url=?
                 ORDER BY id DESC
@@ -964,6 +1027,8 @@ class Storage:
             page_url=row["page_url"],
             uses_count=int(row["uses_count"] or 0),
             disabled=int(row["disabled"] or 0),
+            logged_out=int(row["logged_out"] or 0),
+            rest_until=row["rest_until"],
             locked_by=row["locked_by"],
             locked_until=row["locked_until"],
             tag=row["tag"],
@@ -1098,7 +1163,103 @@ class Storage:
     def is_chat_session_usable(self, chat_session: FullChatSession) -> bool:
         if int(getattr(chat_session, "disabled", 0) or 0) != 0:
             return False
+        if _is_logged_out_or_resting(
+            logged_out=getattr(chat_session, "logged_out", 0),
+            rest_until=getattr(chat_session, "rest_until", None),
+        ):
+            return False
         return not _is_blocked_chat(getattr(chat_session, "chat_id", None), getattr(chat_session, "tag", None))
+
+    def clear_expired_chat_rest_flags(self, now_iso: Optional[str] = None) -> int:
+        self.init()
+        now_iso = now_iso or _now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE chat_sessions SET rest_until=NULL WHERE rest_until IS NOT NULL AND rest_until <= ?;",
+                (now_iso,),
+            )
+            conn.commit()
+            try:
+                return int(cur.rowcount or 0)
+            except Exception:
+                return 0
+
+    def list_rested_direct_chat_sessions(self, *, prompt_id: str, idle_before_iso: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Direct/promptless chat pool for initial allocation.
+
+        Returns chats that are:
+          - active (disabled=0)
+          - not guest/archive
+          - not logged out
+          - not currently resting
+          - idle since <= idle_before_iso
+        """
+        self.init()
+        self.clear_expired_chat_rest_flags()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, container_id, prompt_id, profile_id, socks_id, chat_id, page_url,
+                       uses_count, disabled, logged_out, rest_until, locked_until, tag, updated_at
+                FROM chat_sessions
+                WHERE prompt_id=?
+                  AND disabled=0
+                  AND COALESCE(logged_out,0)=0
+                  AND (rest_until IS NULL OR rest_until <= ?)
+                  AND COALESCE(chat_id,'') NOT IN ('guest','archive')
+                  AND COALESCE(tag,'') NOT IN ('guest','archive')
+                  AND updated_at <= ?
+                ORDER BY updated_at ASC, id ASC
+                LIMIT ?;
+                """,
+                (prompt_id, _now_iso(), idle_before_iso, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_chat_rest_by_url(self, *, page_url: str, ttl_seconds: int) -> Optional[FullChatSession]:
+        self.init()
+        url = (page_url or '').strip()
+        ttl = int(ttl_seconds)
+        if not url or ttl <= 0:
+            return None
+        now = datetime.now(timezone.utc)
+        until = now + timedelta(seconds=ttl)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET rest_until=? WHERE page_url=?;",
+                (until.isoformat(), url),
+            )
+            conn.commit()
+        return self.get_full_chat_session_by_url(url)
+
+    def clear_chat_rest_by_url(self, *, page_url: str) -> bool:
+        self.init()
+        url = (page_url or '').strip()
+        if not url:
+            return False
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE chat_sessions SET rest_until=NULL WHERE page_url=?;",
+                (url,),
+            )
+            conn.commit()
+            try:
+                return int(cur.rowcount or 0) > 0
+            except Exception:
+                return False
+
+    def set_chat_logged_out_by_url(self, *, page_url: str, logged_out: bool) -> Optional[FullChatSession]:
+        self.init()
+        url = (page_url or '').strip()
+        if not url:
+            return None
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET logged_out=? WHERE page_url=?;",
+                (1 if logged_out else 0, url),
+            )
+            conn.commit()
+        return self.get_full_chat_session_by_url(url)
 
     # ------------------------------------------------------------------
     # Chat locks (full feature, оставлено)

@@ -7,14 +7,14 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from ..chats.manager import ChatManager
 from ..containers.selector import ContainerSelector, NotEnoughContainersError
 from ..profiles.manager import ProfileManager
 from ..profiles.profile_lock import ProfileBusyError, ProfileLock
-from ..prompts.registry import PromptRegistry
+from ..prompts.registry import PromptRegistry, PromptSpec
 from ..schemas import SolveAttempt, SolveError, SolveFinal, SolveRequest, SolveResponse
 from ..storage import Storage
 from ..upstream_client import (
@@ -97,12 +97,10 @@ def _pick_text_from_raw(raw: Any) -> str:
     - URL чата хранится в `chat_session.page_url` (БД) и прокидывается отдельно.
     """
     if isinstance(raw, dict):
-        # основные варианты ответа
         for k in ("text", "answer", "message", "result"):
             v = raw.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
-        # иногда upstream возвращает URL (в т.ч. page_url)
         for k in ("url", "page_url"):
             v = raw.get(k)
             if isinstance(v, str) and v.strip():
@@ -115,7 +113,32 @@ def _pick_text_from_raw(raw: Any) -> str:
         return str(raw)
 
 
+def _extract_page_url_from_raw(raw: Any) -> Optional[str]:
+    if isinstance(raw, list):
+        for item in reversed(raw):
+            url = _extract_page_url_from_raw(item)
+            if url:
+                return url
+        return None
+    if isinstance(raw, dict):
+        for key in ("page_url", "url"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _extract_chat_id_from_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    m = re.search(r"/c/([^/?#]+)", str(url))
+    if not m:
+        return None
+    return m.group(1)
+
+
 _BLOCKED_CHAT_IDS = {"guest", "archive"}
+_DIRECT_PROMPT_ID = "__direct__"
 
 
 def _is_blocked_chat(chat_id: Optional[str], tag: Optional[str]) -> bool:
@@ -254,6 +277,12 @@ class MultiContainerExecutor:
             allow_socks_override = bool(getattr(getattr(self._profiles, "_config", None), "allow_socks_override", True))
         self._allow_socks_override = bool(allow_socks_override)
 
+        cfg = getattr(self._profiles, "_config", None)
+        chat_policy = getattr(cfg, "chat_policy", None)
+        self._promptless_idle_seconds = int(getattr(chat_policy, "promptless_idle_seconds", 900) or 900)
+        self._default_rest_ttl_seconds = int(getattr(chat_policy, "default_rest_ttl_seconds", 900) or 900)
+        self._default_max_chat_uses = int(getattr(chat_policy, "default_max_chat_uses", 50) or 50)
+
         self._io_logger = io_logger
 
         try:
@@ -290,29 +319,28 @@ class MultiContainerExecutor:
             return
 
     def _list_recent_prompt_sessions(self, prompt_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        """
-        Возвращает список "свежих" активных chat_sessions (disabled=0) для prompt_id.
+        """Return active reusable chats for a prompt_id.
 
-        Это используется только когда клиент не передал profile_id (автовыбор),
-        чтобы сначала попробовать reuse существующих живых чатов.
-
-        Для твоего кейса (profile_id всегда указан) это почти не участвует,
-        но полезно понимать: reuse логика начинается с БД chat_sessions.
+        Excludes guest/archive, logged_out and currently resting chats.
         """
         rows: list[dict[str, Any]] = []
         try:
+            self._storage.clear_expired_chat_rest_flags()
             with self._storage._connect() as conn:
                 cur = conn.execute(
                     """
-                    SELECT id, container_id, profile_id, socks_id, chat_id, page_url, uses_count, disabled, locked_until, tag, updated_at
+                    SELECT id, container_id, profile_id, socks_id, chat_id, page_url, uses_count,
+                           disabled, logged_out, rest_until, locked_until, tag, updated_at
                     FROM chat_sessions
                     WHERE prompt_id = ? AND disabled = 0
+                      AND COALESCE(logged_out,0)=0
+                      AND (rest_until IS NULL OR rest_until <= ?)
                       AND COALESCE(chat_id,'') NOT IN ('guest','archive')
                       AND COALESCE(tag,'') NOT IN ('guest','archive')
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,
-                    (prompt_id, int(limit)),
+                    (prompt_id, _iso_now(), int(limit)),
                 )
                 for r in cur.fetchall():
                     rows.append(dict(r))
@@ -328,6 +356,7 @@ class MultiContainerExecutor:
         socks_override: Optional[str],
         max_chat_uses: int,
         chat_url: Optional[str],
+        promptless_mode: bool,
     ) -> tuple[list[_ProfileCandidate], Optional[dict[str, Any]]]:
         """
         Строим список кандидатов для попытки выполнения.
@@ -349,11 +378,14 @@ class MultiContainerExecutor:
             cs = self._storage.get_full_chat_session_by_url(chat_url)
             if cs is None:
                 raise ValueError("chat_url не найден в базе (неизвестный чат)")
-            if (cs.prompt_id or "") != (prompt_id or ""):
+            if promptless_mode:
+                if (cs.prompt_id or "") != _DIRECT_PROMPT_ID:
+                    raise ValueError("chat_url требует явного prompt_id: этот чат создан с базовым prompt")
+            elif (cs.prompt_id or "") != (prompt_id or ""):
                 raise ValueError("chat_url не соответствует prompt_id")
 
-            if int(getattr(cs, "disabled", 0) or 0) != 0 or _is_blocked_chat(getattr(cs, "chat_id", None), getattr(cs, "tag", None)):
-                raise ValueError("chat_url относится к заблокированному чату (guest/archive) или disabled=1")
+            if not self._storage.is_chat_session_usable(cs):
+                raise ValueError("chat_url относится к недоступному чату (disabled/guest/archive/rest/logged_out)")
 
             if not profile_id:
                 profile_id = cs.profile_id
@@ -371,6 +403,8 @@ class MultiContainerExecutor:
                 "page_url": cs.page_url,
                 "tag": getattr(cs, "tag", None),
                 "disabled": int(getattr(cs, "disabled", 0) or 0),
+                "logged_out": int(getattr(cs, "logged_out", 0) or 0),
+                "rest_until": getattr(cs, "rest_until", None),
             }
 
         # КЛЮЧЕВО ДЛЯ ТВОЕГО КЕЙСА:
@@ -389,15 +423,32 @@ class MultiContainerExecutor:
                 )
             ], chat_url_row
 
-        # Если profile_id не указан — авто-выбор (не твой кейс):
-        # 1) reuse свежих chat_sessions по prompt_id
-        # 2) добор профилей из list_profiles по наименьшему uses_count
+        # Если profile_id не указан — авто-выбор.
+        # promptless_mode=True:
+        #   1) пробуем direct-чаты, которые достаточно долго не использовались
+        #   2) если их нет — добираем профили и создаём новый direct-чат
+        # promptless_mode=False:
+        #   1) reuse свежих chat_sessions по prompt_id
+        #   2) добор профилей из list_profiles по наименьшему uses_count
         seen: set[tuple[str, Optional[str], Optional[str], Optional[str]]] = set()
         out: list[_ProfileCandidate] = []
 
-        for s in self._list_recent_prompt_sessions(prompt_id, limit=60):
+        session_rows: list[dict[str, Any]]
+        if promptless_mode:
+            idle_before_iso = (datetime.now(timezone.utc) - timedelta(seconds=max(self._promptless_idle_seconds, 0))).isoformat()
+            session_rows = self._storage.list_rested_direct_chat_sessions(
+                prompt_id=_DIRECT_PROMPT_ID,
+                idle_before_iso=idle_before_iso,
+                limit=60,
+            )
+        else:
+            session_rows = self._list_recent_prompt_sessions(prompt_id, limit=60)
+
+        for s in session_rows:
             pid = (s.get("profile_id") or "").strip()
             if not pid:
+                continue
+            if self._profiles.is_manual_only(pid):
                 continue
             uses = int(s.get("uses_count") or 0)
             if uses >= int(max_chat_uses or 0):
@@ -436,6 +487,8 @@ class MultiContainerExecutor:
 
         for p in profiles:
             if p.pending_replace:
+                continue
+            if self._profiles.is_manual_only(p.profile_id):
                 continue
             if p.max_uses is not None and int(p.uses_count or 0) >= int(p.max_uses):
                 continue
@@ -476,7 +529,11 @@ class MultiContainerExecutor:
         request_id = request_id or str(uuid.uuid4())
         started_at = _iso_now()
 
-        prompt_id = (req.options.prompt_id if req.options and req.options.prompt_id else None) or req.prompt_id or "default"
+        requested_prompt_id = (req.options.prompt_id if req.options and req.options.prompt_id else None) or req.prompt_id
+        requested_prompt_id = requested_prompt_id.strip() if isinstance(requested_prompt_id, str) else requested_prompt_id
+        promptless_mode = not bool(requested_prompt_id)
+        prompt_id = _DIRECT_PROMPT_ID if promptless_mode else str(requested_prompt_id)
+        selected_prompt_id: Optional[str] = None if promptless_mode else prompt_id
 
         text = (req.input.text or "").strip() if req.input and req.input.text else ""
         has_image = bool(req.input and req.input.image_b64)
@@ -488,7 +545,8 @@ class MultiContainerExecutor:
             {
                 "event": "mc_solve_start",
                 "request_id": request_id,
-                "prompt_id": prompt_id,
+                "prompt_id": selected_prompt_id,
+                "promptless_mode": bool(promptless_mode),
                 "has_text": bool(text),
                 "text_len": len(text) if text else 0,
                 "has_image": bool(has_image),
@@ -500,7 +558,7 @@ class MultiContainerExecutor:
             return self._fail(
                 job_id="",
                 request_id=request_id,
-                prompt_id=prompt_id,
+                prompt_id=selected_prompt_id,
                 code="INVALID_REQUEST",
                 message="Нужно передать text и/или image_b64",
                 http_status=400,
@@ -511,7 +569,7 @@ class MultiContainerExecutor:
             return self._fail(
                 job_id="",
                 request_id=request_id,
-                prompt_id=prompt_id,
+                prompt_id=selected_prompt_id,
                 code="INVALID_REQUEST",
                 message="Если передан image_b64, нужно указать image_ext",
                 http_status=400,
@@ -519,28 +577,37 @@ class MultiContainerExecutor:
             )
 
         # ===== 1) Resolve prompt spec =====
-        try:
-            ps = self._prompts.get_prompt(prompt_id)
-        except Exception as e:
-            _jlog(
-                logging.ERROR,
-                {
-                    "event": "prompt_resolve_failed",
-                    "request_id": request_id,
-                    "prompt_id": prompt_id,
-                    "error": str(e),
-                },
+        if promptless_mode:
+            ps = PromptSpec(
+                prompt_id=_DIRECT_PROMPT_ID,
+                start_prompt="",
+                default_max_chat_uses=int(self._default_max_chat_uses or 50),
+                file_path="",
             )
-            return self._fail(
-                job_id="",
-                request_id=request_id,
-                prompt_id=prompt_id,
-                code="INVALID_REQUEST",
-                message=f"Unknown prompt_id: {prompt_id}",
-                http_status=400,
-                started_at=started_at,
-                details={"error": str(e)},
-            )
+        else:
+            try:
+                ps = self._prompts.get_prompt(prompt_id)
+            except Exception as e:
+                _jlog(
+                    logging.ERROR,
+                    {
+                        "event": "prompt_resolve_failed",
+                        "request_id": request_id,
+                        "prompt_id": selected_prompt_id,
+                "promptless_mode": bool(promptless_mode),
+                        "error": str(e),
+                    },
+                )
+                return self._fail(
+                    job_id="",
+                    request_id=request_id,
+                    prompt_id=selected_prompt_id,
+                    code="INVALID_REQUEST",
+                    message=f"Unknown prompt_id: {prompt_id}",
+                    http_status=400,
+                    started_at=started_at,
+                    details={"error": str(e)},
+                )
 
         default_max_chat_uses = int(getattr(ps, "default_max_chat_uses", 50) or 50)
 
@@ -587,7 +654,7 @@ class MultiContainerExecutor:
             profile_id=profile_id_opt,
             socks_id=None,
             started_at=started_at,
-            selected_prompt_id=prompt_id,
+            selected_prompt_id=selected_prompt_id,
             decision_mode="multi",
             fanout_requested=1,
             fanout_used=1,
@@ -604,12 +671,13 @@ class MultiContainerExecutor:
                 socks_override=socks_override,
                 max_chat_uses=max_chat_uses,
                 chat_url=chat_url,
+                promptless_mode=promptless_mode,
             )
         except ValueError as e:
             return self._fail(
                 job_id=job_id,
                 request_id=request_id,
-                prompt_id=prompt_id,
+                prompt_id=selected_prompt_id,
                 code="INVALID_REQUEST",
                 message=str(e),
                 http_status=400,
@@ -621,7 +689,7 @@ class MultiContainerExecutor:
             return self._fail(
                 job_id=job_id,
                 request_id=request_id,
-                prompt_id=prompt_id,
+                prompt_id=selected_prompt_id,
                 code="INTERNAL_ERROR",
                 message="Нет доступных профилей (storage.list_profiles вернул пусто)",
                 http_status=500,
@@ -647,7 +715,7 @@ class MultiContainerExecutor:
                 return self._fail(
                     job_id=job_id,
                     request_id=request_id,
-                    prompt_id=prompt_id,
+                    prompt_id=selected_prompt_id,
                     code="INTERNAL_ERROR",
                     message=str(e),
                     http_status=500,
@@ -807,7 +875,7 @@ class MultiContainerExecutor:
                     # chat_session_block_check: guest/archive
                     # Если upstream создал /c/guest (или запись ранее была помечена),
                     # то этот профиль должен быть исключён из работы и НЕЛЬЗЯ создавать новые чаты.
-                    if int(getattr(chat_session, 'disabled', 0) or 0) != 0 or _is_blocked_chat(getattr(chat_session, 'chat_id', None), getattr(chat_session, 'tag', None)):
+                    if not self._storage.is_chat_session_usable(chat_session):
                         cid = (getattr(chat_session, 'chat_id', None) or '').strip().lower()
                         tag = (getattr(chat_session, 'tag', None) or '').strip().lower()
 
@@ -857,7 +925,7 @@ class MultiContainerExecutor:
                                 request_id=request_id,
                                 prompt_id=prompt_id,
                                 code="CHAT_BLOCKED",
-                                message="Чат помечен как guest/archive и не может быть использован.",
+                                message="Чат недоступен (guest/archive/rest/logged_out/disabled) и не может быть использован.",
                                 http_status=409,
                                 started_at=started_at,
                                 profile_id=resolved.profile_id,
@@ -935,6 +1003,15 @@ class MultiContainerExecutor:
 
                             raw = [raw1, raw2]
 
+                        new_page_url = _extract_page_url_from_raw(raw)
+                        if new_page_url:
+                            new_chat_id = _extract_chat_id_from_url(new_page_url)
+                            chat_session = self._storage.update_full_chat_session_by_id(
+                                chat_session.id,
+                                page_url=new_page_url,
+                                chat_id=new_chat_id,
+                            )
+
                         out_text = _pick_text_from_raw(raw if not isinstance(raw, list) else raw[-1])
                         finished_at = _iso_now()
 
@@ -964,7 +1041,7 @@ class MultiContainerExecutor:
                         meta = {
                             "job_id": job_id,
                             "request_id": request_id,
-                            "prompt_id_selected": prompt_id,
+                            "prompt_id_selected": selected_prompt_id,
                             "fanout_requested": 1,
                             "container_ids_used": [container_id],
                             "profile_id": resolved.profile_id,
@@ -974,6 +1051,8 @@ class MultiContainerExecutor:
                             "page_url": chat_session.page_url,
                             "started_at": started_at,
                             "finished_at": finished_at,
+                            "promptless_mode": bool(promptless_mode),
+                            "internal_prompt_key": prompt_id,
                         }
 
                         attempts = None
@@ -981,14 +1060,12 @@ class MultiContainerExecutor:
                             attempts = [
                                 SolveAttempt(
                                     container_id=container_id,
-                                    ok=True,
-                                    role="single",
-                                    text=out_text,
-                                    raw=raw,
+                                    status="succeeded",
+                                    result_text=out_text,
                                 )
                             ]
 
-                        resp = SolveResponse(ok=True, final=SolveFinal(kind="text", text=out_text, raw=raw), meta=meta, attempts=attempts)
+                        resp = SolveResponse(ok=True, final=SolveFinal(text=out_text), meta=meta, attempts=attempts)
                         return 200, resp
 
                     except UpstreamBusyError as e:
@@ -997,7 +1074,7 @@ class MultiContainerExecutor:
                             attempt_id,
                             started_at,
                             request_id,
-                            prompt_id,
+                            selected_prompt_id,
                             resolved.profile_id,
                             socks_key,
                             container_id,
@@ -1013,7 +1090,7 @@ class MultiContainerExecutor:
                             attempt_id,
                             started_at,
                             request_id,
-                            prompt_id,
+                            selected_prompt_id,
                             resolved.profile_id,
                             socks_key,
                             container_id,
@@ -1029,7 +1106,7 @@ class MultiContainerExecutor:
                             attempt_id,
                             started_at,
                             request_id,
-                            prompt_id,
+                            selected_prompt_id,
                             resolved.profile_id,
                             socks_key,
                             container_id,
@@ -1046,7 +1123,7 @@ class MultiContainerExecutor:
                             attempt_id,
                             started_at,
                             request_id,
-                            prompt_id,
+                            selected_prompt_id,
                             resolved.profile_id,
                             socks_key,
                             container_id,
@@ -1090,7 +1167,7 @@ class MultiContainerExecutor:
         attempt_id: str,
         started_at: str,
         request_id: str,
-        prompt_id: str,
+        prompt_id: Optional[str],
         profile_id: str,
         socks_id: Optional[str],
         container_id: str,
@@ -1169,7 +1246,7 @@ class MultiContainerExecutor:
         *,
         job_id: str,
         request_id: str,
-        prompt_id: str,
+        prompt_id: Optional[str],
         code: str,
         message: str,
         http_status: int,

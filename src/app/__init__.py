@@ -1,1 +1,4 @@
-from .main import create_app  # noqa: F401
+#copyright "Kilax @kilax9276"
+from .version import __version__
+
+__all__ = ["__version__"]
